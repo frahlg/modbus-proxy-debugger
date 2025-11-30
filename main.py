@@ -272,8 +272,21 @@ class SharedUpstream:
                 await self.writer.drain()
                 return await asyncio.wait_for(read_frame(self.reader), self.timeout)
             except Exception as e:
+                # If we lose connection during exchange, clear the writer so next request reconnects
+                logger.warning(f"Upstream connection failed during exchange: {e}")
                 self.writer = None
                 raise e
+
+    async def check_connection(self):
+        """Proactively checks if upstream is reachable."""
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), self.timeout)
+            w.close()
+            await w.wait_closed()
+            return True
+        except Exception:
+            return False
 
 async def handle_client(reader, writer, upstream, log_dir):
     client_ip = writer.get_extra_info('peername')[0]
@@ -309,6 +322,8 @@ async def handle_client(reader, writer, upstream, log_dir):
 
             writer.write(res)
             await writer.drain()
+    except OSError as e:
+        logger.error(f"[{client_ip}] Network error (client or upstream): {e}")
     except Exception as e:
         logger.error(f"[{client_ip}] Handler error: {e}")
     finally:
@@ -332,6 +347,13 @@ async def main():
 
     host, port = args.target.split(":")
     upstream = SharedUpstream(host, int(port), 5.0)
+    
+    # Check upstream connection at startup
+    if not await upstream.check_connection():
+        logger.warning(f"Could not connect to upstream {args.target}. Proxy will still start, but requests may fail.")
+    else:
+        logger.info(f"Successfully verified connection to upstream {args.target}")
+
     b_host, b_port = args.bind.split(":")
 
     server = await asyncio.start_server(lambda r, w: handle_client(r, w, upstream, log_dir), b_host, int(b_port))
