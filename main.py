@@ -264,18 +264,32 @@ class SharedUpstream:
     
     async def exchange(self, req):
         async with self.lock:
-            try:
-                if not self.writer or self.writer.is_closing():
-                    self.reader, self.writer = await asyncio.wait_for(
-                        asyncio.open_connection(self.host, self.port), self.timeout)
-                self.writer.write(req)
-                await self.writer.drain()
-                return await asyncio.wait_for(read_frame(self.reader), self.timeout)
-            except Exception as e:
-                # If we lose connection during exchange, clear the writer so next request reconnects
-                logger.warning(f"Upstream connection failed during exchange: {e}")
-                self.writer = None
-                raise e
+            # Try up to 2 times (1 retry) if connection fails
+            for attempt in range(2):
+                try:
+                    if not self.writer or self.writer.is_closing():
+                        logger.debug(f"Connecting to upstream {self.host}:{self.port}...")
+                        self.reader, self.writer = await asyncio.wait_for(
+                            asyncio.open_connection(self.host, self.port), self.timeout)
+                        logger.info(f"Connected to upstream {self.host}:{self.port}")
+
+                    self.writer.write(req)
+                    await self.writer.drain()
+                    
+                    response = await asyncio.wait_for(read_frame(self.reader), self.timeout)
+                    return response
+
+                except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
+                    logger.warning(f"Upstream connection failed (attempt {attempt+1}/2): {e}")
+                    self.writer = None # Force reconnect next time
+                    
+                    # If this was the last attempt, re-raise the exception
+                    if attempt == 1:
+                        raise e
+                    
+                    # Small backoff before retry
+                    await asyncio.sleep(0.5)
+            return None
 
     async def check_connection(self):
         """Proactively checks if upstream is reachable."""
