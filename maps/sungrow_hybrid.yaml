@@ -1,0 +1,253 @@
+name: "Sungrow Hybrid Inverter"
+byte_order: "big"
+registers:
+  # --- Common System Info (Input Registers - 04) ---
+  5000:
+    name: "Device Type Code"
+    type: "U16"
+  5001:
+    name: "Nominal Active Power"
+    unit: "kW"
+    scale: 0.1
+    type: "U16"
+  5002:
+    name: "Output Type"
+    type: "U16"
+  5003:
+    name: "Daily Power Yield"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  5005:
+    name: "Total Power Yield"
+    unit: "kWh"
+    scale: 0.1
+    type: "U32" # 5005-5006
+  5007:
+    name: "Internal Temperature"
+    unit: "°C"
+    scale: 0.1
+    type: "S16"
+  5010:
+    name: "MPPT1 Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  5011:
+    name: "MPPT1 Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  5012:
+    name: "MPPT2 Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  5013:
+    name: "MPPT2 Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  5016:
+    name: "Total DC Power"
+    unit: "W"
+    type: "U32" # 5016-5017
+
+  # --- Grid / Output (Input Registers - 04) ---
+  4990:
+    name: "PC Active Power" # Sometimes seen here
+    unit: "W"
+    type: "U16"
+  5018:
+    name: "Phase A Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  5019:
+    name: "Phase B Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  5020:
+    name: "Phase C Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  5021:
+    name: "Phase A Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  5022:
+    name: "Phase B Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  5023:
+    name: "Phase C Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  5030:
+    name: "Total Active Power"
+    unit: "W"
+    type: "S32" # 5030-5031
+  5032:
+    name: "Total Reactive Power"
+    unit: "Var"
+    type: "S32" # 5032-5033
+  5035:
+    name: "Grid Frequency"
+    unit: "Hz"
+    scale: 0.1
+    type: "U16"
+
+  # --- Battery Data (Input Registers - 04) ---
+  13000:
+    name: "Battery Voltage"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  13001:
+    name: "Battery Current"
+    unit: "A"
+    scale: 0.1
+    type: "U16"
+  13002:
+    name: "Battery Power"
+    unit: "W"
+    type: "U16"
+  13004:
+    name: "Battery Level (SOC)"
+    unit: "%"
+    scale: 0.1
+    type: "U16"
+  13005:
+    name: "Battery Health (SOH)"
+    unit: "%"
+    scale: 0.1
+    type: "U16"
+  13006:
+    name: "Battery Temperature"
+    unit: "°C"
+    scale: 0.1
+    type: "S16"
+  13007:
+    name: "Daily Battery Charge"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13009:
+    name: "Daily Battery Discharge"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13012:
+    name: "Self-Consumption from PV"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13014:
+    name: "Self-Consumption from Battery"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13019:
+    name: "PV1 Voltage (Dup)"
+    unit: "V"
+    scale: 0.1
+    type: "U16"
+  13021:
+    name: "PV1 Power (Dup)"
+    unit: "W"
+    type: "U16"
+  13022:
+    name: "Battery State"
+    type: "U16" # Enum usually
+  13023:
+    name: "Running State (Dup)"
+    type: "U16"
+  13024:
+    name: "Daily PV Yield (Dup)"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13026:
+    name: "Export Power"
+    unit: "W"
+    type: "S32" # 13026-13027
+  13028:
+    name: "Daily Export Energy"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13033:
+    name: "Daily Import Energy"
+    unit: "kWh"
+    scale: 0.1
+    type: "U16"
+  13036:
+    name: "Total PV Energy"
+    unit: "kWh"
+    scale: 0.1
+    type: "U32" # 13036-13037
+  13040:
+    name: "Total CO2 Reduction"
+    unit: "kg"
+    scale: 0.1
+    type: "U32"
+  13045:
+    name: "Total Export Energy"
+    unit: "kWh"
+    scale: 0.1
+    type: "U32" # 13045-13046
+  
+  # --- Load / Consumption (Input Registers - 04) ---
+  13007:
+    name: "Load Power"
+    unit: "W"
+    type: "S32" # Check manual, might be U16 or S32 depending on FW
+  13016:
+    name: "Total Load Power"
+    unit: "W"
+    type: "S32" # 13016-13017
+
+  # --- System State / Control (Holding Registers - 03) ---
+  # These are the critical control registers for EMS
+  
+  12999:
+    name: "System State" 
+    type: "U16"
+    # 0x00: Stop, 0x02: Standby, 0x03: Fault, 0x08: Run (Grid), 0x20: Run (Off-grid)
+  
+  13000:
+    name: "Running State"
+    type: "U16"
+  
+  13049:
+    name: "EMS Mode Selection"
+    type: "U16"
+    # 0: Self-consumption (Default)
+    # 2: Forced Charge/Discharge (External Control)
+    
+  13050:
+    name: "EMS Charge Power Command"
+    unit: "W"
+    type: "U16"
+    
+  13051:
+    name: "EMS Discharge Power Command"
+    unit: "W"
+    type: "U16"
+    
+  13057:
+    name: "Forced Charge/Discharge Cmd"
+    type: "U16"
+    # 0xAA: Stop (Give control back to inverter)
+    # 0xBB: Charge
+    # 0xCC: Discharge
+
+  13099:
+    name: "Reserved Battery Level (Backup)"
+    unit: "%"
+    type: "U16"
