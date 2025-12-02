@@ -27,6 +27,27 @@ except ImportError:
 logger = logging.getLogger("modbus_proxy")
 csv_logger = logging.getLogger("csv_data")
 
+class TimestampedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotates logs by size but names them with a timestamp."""
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        
+        # Timestamp format: YYYY-MM-DD_HH-MM-SS
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        base, ext = os.path.splitext(self.baseFilename)
+        new_name = f"{base}_{timestamp}{ext}"
+        
+        if os.path.exists(self.baseFilename):
+            try:
+                os.rename(self.baseFilename, new_name)
+            except OSError:
+                pass
+        
+        if not self.delay:
+            self.stream = self._open()
+
 def setup_logging(log_file=None, debug=False):
     formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(message)s', datefmt='%H:%M:%S')
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
@@ -39,11 +60,11 @@ def setup_logging(log_file=None, debug=False):
         log_dir = os.path.dirname(log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-        # Rotate when file reaches 5MB, keep 10 backups
-        fh = logging.handlers.RotatingFileHandler(
+        # Rotate when file reaches 5MB, keep unlimited backups (managed by check_log_size)
+        fh = TimestampedRotatingFileHandler(
             log_file, 
             maxBytes=5*1024*1024, 
-            backupCount=10, 
+            backupCount=0, 
             encoding='utf-8'
         )
         fh.setFormatter(formatter)
@@ -52,10 +73,10 @@ def setup_logging(log_file=None, debug=False):
     # CSV setup
     csv_file = log_file.replace(".log", ".csv") if log_file else "modbus_data.csv"
     # CSV also needs rotation to prevent massive files
-    csv_handler = logging.handlers.RotatingFileHandler(
+    csv_handler = TimestampedRotatingFileHandler(
         csv_file,
         maxBytes=5*1024*1024,
-        backupCount=10,
+        backupCount=0,
         encoding='utf-8'
     )
     csv_handler.setFormatter(logging.Formatter('%(message)s'))
@@ -65,7 +86,7 @@ def setup_logging(log_file=None, debug=False):
     if os.stat(csv_file).st_size == 0:
         csv_logger.info("Timestamp,Client,TransactionID,Function,Address,RegisterName,RawHex,DecimalValue,ScaledValue,Unit")
 
-def check_log_size(log_dir, max_size_mb=200):
+def check_log_size(log_dir, max_size_mb=1024):
     """Checks total size of log directory and removes oldest files if over limit."""
     try:
         total_size = 0
@@ -207,6 +228,25 @@ class ModbusMapper:
 
 # Initialize Global Mapper
 mapper = None
+last_log_check = 0
+
+def build_exception_packet(req, exception_code):
+    """Constructs a Modbus Exception response."""
+    try:
+        tid = req[0:2]
+        unit_id = req[6]
+        func_code = req[7]
+        
+        # Modbus TCP Header: TID (2) + Proto (2) + Len (2)
+        # Len = 1 (Unit) + 1 (Func) + 1 (Code) = 3
+        header = tid + b'\x00\x00' + b'\x00\x03'
+        
+        # PDU: Unit + (Func | 0x80) + Exception Code
+        pdu = bytes([unit_id, func_code | 0x80, exception_code])
+        
+        return header + pdu
+    except Exception:
+        return None
 
 def decode_packet(data, direction="req", context=None):
     if not data: return "Empty Packet", None
@@ -281,6 +321,12 @@ class SharedUpstream:
 
                 except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
                     logger.warning(f"Upstream connection failed (attempt {attempt+1}/2): {e}")
+                    if self.writer:
+                        try:
+                            self.writer.close()
+                            await self.writer.wait_closed()
+                        except Exception:
+                            pass
                     self.writer = None # Force reconnect next time
                     
                     # If this was the last attempt, re-raise the exception
@@ -305,10 +351,15 @@ class SharedUpstream:
 async def handle_client(reader, writer, upstream, log_dir):
     client_ip = writer.get_extra_info('peername')[0]
     logger.info(f"Client connected: {client_ip}")
+    
+    global last_log_check
+    
     try:
         while True:
-            # Check log size periodically (simple probability check to avoid excessive IO)
-            if log_dir and time.time() % 300 < 1: # Check roughly every 5 mins
+            # Check log size periodically (timestamp based to avoid spamming IO)
+            now = time.time()
+            if log_dir and (now - last_log_check > 300): 
+                last_log_check = now
                 check_log_size(log_dir)
 
             req = await read_frame(reader)
@@ -322,8 +373,20 @@ async def handle_client(reader, writer, upstream, log_dir):
             res = await upstream.exchange(req)
             
             if not res:
-                logger.warning(f"[{client_ip}] Upstream disconnected while waiting for response. Closing client.")
-                break
+                logger.warning(f"[{client_ip}] Upstream timeout/fail. Sending Gateway Timeout exception.")
+                # Send Modbus Exception 0x0B (Gateway Target Device Failed to Respond)
+                # This keeps the client connection alive instead of killing it.
+                exc_pkt = build_exception_packet(req, 0x0B)
+                if exc_pkt:
+                    writer.write(exc_pkt)
+                    await writer.drain()
+                    
+                    # Log the exception response
+                    logger.info(f"[{client_ip}] <-- TID:{req[0:2].hex()} EXCEPTION (Gateway Timeout)")
+                else:
+                    # Failed to build exception (weird packet), break connection
+                    break
+                continue
 
             res_str, csv_data = decode_packet(res, "res", ctx)
             logger.info(f"[{client_ip}] <-- {res_str}")
@@ -360,7 +423,7 @@ async def main():
     mapper = ModbusMapper(args.map)
 
     host, port = args.target.split(":")
-    upstream = SharedUpstream(host, int(port), 5.0)
+    upstream = SharedUpstream(host, int(port), 10.0)
     
     # Check upstream connection at startup
     if not await upstream.check_connection():
