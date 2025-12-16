@@ -14,9 +14,9 @@ It provides:
 - **Project Management**: Built with `uv` for fast, reliable Python dependency management.
 - **Transparent Proxy**: Works with any Modbus TCP traffic.
 - **Robust Logging**: 
-    - Rolling logs (5MB limit).
-    - Auto-cleanup (Limits folder to 200MB).
-    - CSV export for Excel/Pandas analysis.
+    - Concise by default with de-duplication of repeated lines.
+    - Rolling logs (2MB chunks) with directory retention controls.
+    - Optional CSV export for Excel/Pandas analysis.
 - **Hardware Agnostic**: Just swap the YAML file to support Sungrow, Huawei, Victron, etc.
 
 ## Installation
@@ -45,6 +45,23 @@ Use a map to decode values:
 uv run main.py --target 192.168.1.50:502 --map maps/sungrow_hybrid.yaml
 ```
 
+### Safe Default (Read-only proxy)
+Writes (FC06/FC16) are blocked unless you explicitly allow them:
+```bash
+uv run main.py --target 192.168.1.50:502
+```
+To allow writes:
+```bash
+uv run main.py --target 192.168.1.50:502 --allow-write
+```
+
+### Monitoring endpoints
+Expose a tiny HTTP server for health and stats:
+```bash
+uv run main.py --target 192.168.1.50:502 --http 127.0.0.1:8080
+```
+Then query `GET /health` or `GET /metrics`.
+
 ## Register Maps
 
 Maps are located in the `maps/` directory.
@@ -52,17 +69,35 @@ You can create your own by following the format in `maps/sungrow_hybrid.yaml`.
 
 **Format:**
 ```yaml
-registers:
-  13000:
-    name: "Battery Voltage"
-    unit: "V"
-    scale: 0.1
-    type: "U16"
+name: "My Device"
+byte_order: "big"
+word_order: "big" # for 32-bit: \"big\" or \"swap\"\n+
+input_registers: # FC04
+  registers:
+    13000:
+      name: "Battery Voltage"
+      unit: "V"
+      scale: 0.1
+      type: "U16"
+
+holding_registers: # FC03
+  registers:
+    13049:
+      name: "EMS Mode Selection"
+      type: "U16"
+```
+
+You can also compose maps using `include:`:
+```yaml
+include:
+  - base.yaml
+  - overrides.yaml
 ```
 
 ## Logging Policy
 
 - **Log File**: Defaults to `logs/modbus.log`.
-- **Rotation**: Files rotate every 5MB.
-- **Retention**: Keeps last 10 files.
-- **Cleanup**: Automatically deletes old logs if total folder size > 200MB.
+- **Rotation**: Files rotate every 2MB.
+- **De-duplication**: repeated identical lines are summarized automatically.
+- **Retention**: controlled by `--max-log-files` and `--max-log-dir-mb`.
+- **CSV**: disable with `--no-csv` if you only need logs.
