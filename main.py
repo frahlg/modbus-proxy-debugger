@@ -1,11 +1,15 @@
 import atexit
 import asyncio
 import argparse
+from collections import deque
+import html
 import logging
 import logging.handlers
 import os
+import re
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,6 +39,47 @@ except ImportError:
 
 logger = logging.getLogger("modbus_proxy")
 csv_logger = logging.getLogger("modbus_proxy.csv")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class InMemoryLogBuffer:
+    """Ring buffer of recent log lines for the web UI."""
+
+    def __init__(self, *, max_lines: int = 800):
+        self.max_lines = max(50, int(max_lines))
+        self._lines: deque[str] = deque(maxlen=self.max_lines)
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+
+    def tail(self, n: int = 250) -> list[str]:
+        with self._lock:
+            if n <= 0:
+                return []
+            # deque doesn't support slicing
+            return list(self._lines)[-int(n) :]
+
+
+log_buffer = InMemoryLogBuffer(max_lines=800)
+
+
+class InMemoryLogHandler(logging.Handler):
+    """Captures formatted log lines into the in-memory buffer."""
+
+    def __init__(self, buffer: InMemoryLogBuffer):
+        super().__init__(level=logging.INFO)
+        self.buffer = buffer
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+            line = _ANSI_RE.sub("", line)
+            self.buffer.append(line)
+        except Exception:
+            self.handleError(record)
 
 
 class TimestampedRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -176,6 +221,11 @@ def setup_logging(
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(formatter)
     logger.addHandler(DedupingHandler(ch, window_s=dedup_window_s))
+
+    # In-memory log tail for the web UI (dedup too)
+    mh = InMemoryLogHandler(log_buffer)
+    mh.setFormatter(formatter)
+    logger.addHandler(DedupingHandler(mh, window_s=dedup_window_s))
 
     # File handler (dedup as well)
     if log_file:
@@ -662,6 +712,18 @@ class SharedUpstream:
         except Exception:
             return False
 
+    async def close(self) -> None:
+        """Close any cached upstream connection."""
+        async with self.lock:
+            if self.writer:
+                try:
+                    self.writer.close()
+                    await self.writer.wait_closed()
+                except Exception:
+                    pass
+            self.reader = None
+            self.writer = None
+
 
 def _http_response(status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> bytes:
     reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Error"}.get(
@@ -702,7 +764,56 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         uptime_s = max(0.0, time.time() - stats.start_ts)
         avg_latency = (stats.total_latency_ms / stats.responses) if stats.responses else 0.0
 
-        if path in ("/health", "/healthz"):
+        if path in ("/", "/ui"):
+            lines = log_buffer.tail(250)
+            log_html = "\n".join(html.escape(l) for l in lines)
+            body = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="2" />
+    <title>Modbus Proxy Debugger</title>
+    <style>
+      body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }}
+      .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+      .card {{ border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; }}
+      .k {{ color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }}
+      .v {{ font-size: 20px; font-weight: 800; }}
+      pre {{ background: #0b1220; color: #d1d5db; padding: 12px; border-radius: 10px; overflow: auto; max-height: 60vh; }}
+      a {{ color: #2563eb; text-decoration: none; }}
+      .top {{ display:flex; align-items: baseline; justify-content: space-between; gap: 12px; }}
+      .small {{ color:#6b7280; font-size: 12px; }}
+    </style>
+  </head>
+  <body>
+    <div class="top">
+      <div>
+        <div style="font-size:18px;font-weight:900">Modbus Proxy Debugger</div>
+        <div class="small">Auto-refresh every 2s • <a href="/health">/health</a> • <a href="/metrics">/metrics</a></div>
+      </div>
+      <div class="small">Uptime: {uptime_s:.0f}s</div>
+    </div>
+
+    <div class="grid" style="margin-top:12px">
+      <div class="card"><div class="k">Active clients</div><div class="v">{stats.active_clients}</div></div>
+      <div class="card"><div class="k">Total clients</div><div class="v">{stats.total_clients}</div></div>
+      <div class="card"><div class="k">Requests</div><div class="v">{stats.requests}</div></div>
+      <div class="card"><div class="k">Responses</div><div class="v">{stats.responses}</div></div>
+      <div class="card"><div class="k">Upstream errors</div><div class="v">{stats.upstream_errors}</div></div>
+      <div class="card"><div class="k">Blocked writes</div><div class="v">{stats.blocked_writes}</div></div>
+      <div class="card"><div class="k">Avg latency</div><div class="v">{avg_latency:.1f}ms</div></div>
+      <div class="card"><div class="k">Max latency</div><div class="v">{stats.max_latency_ms:.1f}ms</div></div>
+    </div>
+
+    <div style="margin-top:12px" class="card">
+      <div class="k">Recent logs</div>
+      <pre>{log_html}</pre>
+    </div>
+  </body>
+</html>
+"""
+            writer.write(_http_response(200, body, content_type="text/html; charset=utf-8"))
+        elif path in ("/health", "/healthz"):
             writer.write(_http_response(200, "ok\n"))
         elif path in ("/metrics", "/stats"):
             body = (
@@ -824,6 +935,12 @@ async def handle_client(
         logger.error(f"[{client_ip}] Handler error: {e}")
     finally:
         stats.active_clients = max(0, stats.active_clients - 1)
+        # When the last client disconnects, close upstream so the process can exit cleanly.
+        if stats.active_clients == 0:
+            try:
+                await upstream.close()
+            except Exception:
+                pass
         try:
             writer.close()
         except Exception:

@@ -108,12 +108,12 @@ async def test_proxy_forwards_read_without_hardware(tmp_path):
     proxy_host, proxy_port = proxy.sockets[0].getsockname()[:2]
 
     async with upstream, proxy:
-        reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(proxy_host, proxy_port), timeout=2.0)
         req = req_read(tid=0x1234, unit=1, func=4, start=100, qty=2)
         writer.write(req)
         await writer.drain()
 
-        resp = await read_frame(reader)
+        resp = await asyncio.wait_for(read_frame(reader), timeout=2.0)
         # Expect FC04 response with bytecount 4 and register values 100, 101
         assert resp[0:2] == b"\x12\x34"
         assert resp[7] == 4
@@ -154,12 +154,12 @@ async def test_proxy_blocks_writes_by_default(tmp_path):
     proxy_host, proxy_port = proxy.sockets[0].getsockname()[:2]
 
     async with upstream, proxy:
-        reader, writer = await asyncio.open_connection(proxy_host, proxy_port)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(proxy_host, proxy_port), timeout=2.0)
         req = req_write_single(tid=0xBEEF, unit=1, addr=10, value=0x0001)
         writer.write(req)
         await writer.drain()
 
-        resp = await read_frame(reader)
+        resp = await asyncio.wait_for(read_frame(reader), timeout=2.0)
         # Should be exception illegal function (0x01)
         assert resp[0:2] == b"\xBE\xEF"
         assert resp[7] == (6 | 0x80)
@@ -167,4 +167,47 @@ async def test_proxy_blocks_writes_by_default(tmp_path):
 
         writer.close()
         await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_http_ui_renders(tmp_path):
+    upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+    upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import main  # noqa: E402
+
+    log_file = str(tmp_path / "modbus.log")
+    proxy, http_server = await main.start_proxy(
+        bind="127.0.0.1:0",
+        target=f"{upstream_host}:{upstream_port}",
+        map_path=None,
+        log_file=log_file,
+        verbose=False,
+        debug=False,
+        allow_write=False,
+        timeout_s=2.0,
+        max_retries=0,
+        max_frame_bytes=512,
+        dedup_window_s=0.2,
+        max_log_dir_mb=50,
+        max_log_files=20,
+        http_bind="127.0.0.1:0",
+        csv_enabled=False,
+        csv_file=None,
+    )
+    assert http_server is not None
+    http_host, http_port = http_server.sockets[0].getsockname()[:2]
+
+    async with upstream, proxy, http_server:
+        r, w = await asyncio.wait_for(asyncio.open_connection(http_host, http_port), timeout=2.0)
+        w.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await w.drain()
+        data = await asyncio.wait_for(r.read(65536), timeout=2.0)
+        w.close()
+        await w.wait_closed()
+
+        assert b"200 OK" in data
+        assert b"Modbus Proxy Debugger" in data
+        assert b"Recent logs" in data
 
