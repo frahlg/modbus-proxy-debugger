@@ -62,6 +62,21 @@ uv run main.py --target 192.168.1.50:502 --http 127.0.0.1:8080
 ```
 Then query `GET /health` or `GET /metrics`.
 
+### Web UI & Control API
+The proxy now launches a FastAPI control plane (default `--api-bind 127.0.0.1:8000`) with a built-in React dashboard at `http://<host>:<port>/web`.
+
+Endpoints (all JSON unless noted):
+- `GET /api/status` – running state, current config, stats, and map inventory.
+- `POST /api/start` – start/restart using the provided config payload (same fields as CLI flags; `allow_write` controls read-only mode, `csv_enabled` toggles CSV export).
+- `POST /api/stop` – stop listening/forwarding without exiting the process.
+- `POST /api/config` – apply partial updates (bind/target/map/log retention toggles) live.
+- `POST /api/map/upload` – multipart upload of YAML maps; `set_current=true` immediately activates it.
+- `POST /api/map/select` – switch to a map already on disk.
+- `GET /api/maps` – enumerate known maps.
+- `WEBSOCKET /api/ws/live` – streaming stats and deduplicated log lines for the dashboard.
+
+The UI surfaces connection status, per-client activity, decoded request/response history, read-only/CSV/log retention toggles, and map management. All CLI flags seed the initial configuration; any field can be changed through the API without restarting the process.
+
 ## Register Maps
 
 Maps are located in the `maps/` directory.
@@ -101,3 +116,9 @@ include:
 - **De-duplication**: repeated identical lines are summarized automatically.
 - **Retention**: controlled by `--max-log-files` and `--max-log-dir-mb`.
 - **CSV**: disable with `--no-csv` if you only need logs.
+
+## Deployment Notes
+
+- API/UI bind defaults to `127.0.0.1:8000` for safety; change `--api-bind` deliberately if you need remote access and place it behind authentication/reverse-proxy controls.
+- Proxy bind defaults to `0.0.0.0:5020`; lock it down to an explicit interface/port for production.
+- No default credentials are enforced by the API—treat it as an administrative surface and secure network access appropriately.
