@@ -1,13 +1,15 @@
 import atexit
 import asyncio
+import contextlib
 import argparse
 import logging
 import logging.handlers
 import os
+import pathlib
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any, Optional
 
@@ -31,6 +33,11 @@ except ImportError:
             return ""
 
     Fore = Style = _MockColor()  # type: ignore
+
+
+import uvicorn
+
+from server.api import LiveFeed, create_app
 
 
 logger = logging.getLogger("modbus_proxy")
@@ -151,6 +158,28 @@ class DedupingHandler(logging.Handler):
                 self.inner.close()
             finally:
                 super().close()
+
+
+class BroadcastHandler(logging.Handler):
+    """Pushes formatted log lines to the live feed broadcaster."""
+
+    def __init__(self, feed: LiveFeed):
+        super().__init__(logging.INFO)
+        self.feed = feed
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+            self.feed.publish(
+                {
+                    "type": "log",
+                    "level": record.levelname.lower(),
+                    "message": line,
+                    "timestamp": time.time(),
+                }
+            )
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging(
@@ -500,7 +529,7 @@ mapper: ModbusMapper = ModbusMapper()
 
 @dataclass
 class Stats:
-    start_ts: float = time.time()
+    start_ts: float = field(default_factory=time.time)
     active_clients: int = 0
     total_clients: int = 0
     requests: int = 0
@@ -516,6 +545,11 @@ class Stats:
 
 
 stats = Stats()
+
+
+def reset_stats() -> None:
+    global stats
+    stats = Stats()
 
 
 def build_exception_packet(req: bytes, exception_code: int) -> Optional[bytes]:
@@ -864,6 +898,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--api-bind",
+        default=os.environ.get("MODBUS_PROXY_API_BIND", "127.0.0.1:8000"),
+        help="Host:port for the FastAPI control plane and web UI",
+    )
+
+    parser.add_argument(
         "--no-csv",
         action="store_true",
         help="Disable CSV export (reduces disk usage)",
@@ -956,6 +996,106 @@ async def start_proxy(
     return server, http_server
 
 
+@dataclass
+class ProxyConfig:
+    bind: str
+    target: str
+    map_path: Optional[str]
+    log_file: Optional[str]
+    verbose: bool
+    debug: bool
+    allow_write: bool
+    timeout_s: float
+    max_retries: int
+    max_frame_bytes: int
+    dedup_window_s: float
+    max_log_dir_mb: int
+    max_log_files: int
+    http_bind: Optional[str]
+    csv_enabled: bool
+    csv_file: Optional[str]
+
+    def to_kwargs(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class ProxyController:
+    """Orchestrates proxy lifecycle and bridges it to the API layer."""
+
+    def __init__(self, feed: LiveFeed):
+        self.feed = feed
+        self.config: Optional[ProxyConfig] = None
+        self.server: Optional[asyncio.AbstractServer] = None
+        self.http_server: Optional[asyncio.AbstractServer] = None
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._log_handler: Optional[BroadcastHandler] = None
+
+    async def start(self, config_dict: dict[str, Any]) -> dict[str, Any]:
+        cfg = ProxyConfig(**config_dict)
+        await self.stop()
+
+        reset_stats()
+        self.config = cfg
+        self.server, self.http_server = await start_proxy(**cfg.to_kwargs())
+        self._attach_log_handler()
+        self._start_tasks()
+        self.feed.publish({"type": "stats", "data": self.snapshot()})
+        return self.snapshot()
+
+    async def stop(self) -> dict[str, Any]:
+        if self._log_handler:
+            try:
+                logger.removeHandler(self._log_handler)
+            except ValueError:
+                pass
+            self._log_handler = None
+
+        for task in self._tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._tasks.clear()
+
+        for srv in [self.server, self.http_server]:
+            if srv:
+                srv.close()
+                with contextlib.suppress(Exception):
+                    await srv.wait_closed()
+
+        self.server = None
+        self.http_server = None
+        return self.snapshot()
+
+    async def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        if not self.config:
+            raise ValueError("Proxy not configured yet")
+        merged = replace(self.config, **updates)
+        self.config = merged
+        if self.server:
+            return await self.start(merged.to_kwargs())
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "running": bool(self.server),
+            "config": asdict(self.config) if self.config else None,
+            "stats": asdict(stats),
+            "map_loaded": mapper.device_name,
+        }
+
+    def _start_tasks(self) -> None:
+        if self.server:
+            self._tasks.append(asyncio.create_task(self.server.serve_forever()))
+        if self.http_server:
+            self._tasks.append(asyncio.create_task(self.http_server.serve_forever()))
+
+    def _attach_log_handler(self) -> None:
+        handler = BroadcastHandler(self.feed)
+        handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d - %(message)s", datefmt="%H:%M:%S"))
+        logger.addHandler(handler)
+        self._log_handler = handler
+
+
 async def main_async(argv: Optional[list[str]] = None) -> None:
     parser = create_argument_parser()
     args = parser.parse_args(argv)
@@ -963,7 +1103,9 @@ async def main_async(argv: Optional[list[str]] = None) -> None:
     if not args.target:
         parser.error("--target is required (or set MODBUS_PROXY_TARGET)")
 
-    server, http_server = await start_proxy(
+    feed = LiveFeed()
+    controller = ProxyController(feed)
+    initial_config = ProxyConfig(
         bind=args.bind,
         target=args.target,
         map_path=args.map,
@@ -982,12 +1124,35 @@ async def main_async(argv: Optional[list[str]] = None) -> None:
         csv_file=args.csv_file,
     )
 
-    async with server:
-        if http_server:
-            async with http_server:
-                await asyncio.gather(server.serve_forever(), http_server.serve_forever())
-        else:
-            await server.serve_forever()
+    await controller.start(initial_config.to_kwargs())
+
+    app = create_app(
+        controller,
+        feed,
+        maps_dir=pathlib.Path("maps"),
+        web_dir=pathlib.Path("web"),
+    )
+
+    api_host, api_port_str = args.api_bind.split(":")
+    api_config = uvicorn.Config(
+        app,
+        host=api_host,
+        port=int(api_port_str),
+        log_level="info",
+        access_log=False,
+        loop="asyncio",
+        lifespan="on",
+        server_header=False,
+    )
+    api_config.install_signal_handlers = False
+    api_server = uvicorn.Server(api_config)
+
+    logger.info(f"API listening on http://{args.api_bind} (web UI at /web)")
+
+    try:
+        await api_server.serve()
+    finally:
+        await controller.stop()
 
 
 def run() -> None:

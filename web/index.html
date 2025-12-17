@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Modbus Proxy Debugger</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <style>
+      body {
+        font-family: "Inter", system-ui, -apple-system, sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      header {
+        background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        padding: 16px 24px;
+        color: #0b1224;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      main {
+        padding: 16px 24px 48px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 16px;
+      }
+      .card {
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      }
+      h2 {
+        margin-top: 0;
+        margin-bottom: 12px;
+        font-size: 18px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #94a3b8;
+        margin-bottom: 6px;
+      }
+      input,
+      select {
+        width: 100%;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid #1f2937;
+        background: #0b1220;
+        color: #e2e8f0;
+        box-sizing: border-box;
+        margin-bottom: 10px;
+      }
+      button {
+        background: #0ea5e9;
+        color: #0b1224;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #1f2937;
+        color: #e2e8f0;
+      }
+      .badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .badge.green {
+        background: #bbf7d0;
+        color: #064e3b;
+      }
+      .badge.red {
+        background: #fecdd3;
+        color: #7f1d1d;
+      }
+      .logs,
+      .history {
+        background: #0b1220;
+        border-radius: 10px;
+        padding: 12px;
+        border: 1px solid #1f2937;
+        max-height: 320px;
+        overflow-y: auto;
+        font-family: "JetBrains Mono", "SFMono-Regular", monospace;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .switch {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .switch input {
+        width: auto;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 8px;
+      }
+      .stat {
+        background: #0b1220;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #1f2937;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>Modbus Proxy Debugger</div>
+      <div id="status-chip"></div>
+    </header>
+    <main>
+      <div id="root"></div>
+    </main>
+    <script type="text/babel">
+      const { useEffect, useState, useMemo, useRef } = React;
+
+      const defaultConfig = {
+        bind: "0.0.0.0:5020",
+        target: "",
+        map_path: null,
+        log_file: "logs/modbus.log",
+        verbose: false,
+        debug: false,
+        allow_write: false,
+        timeout_s: 10.0,
+        max_retries: 1,
+        max_frame_bytes: 512,
+        dedup_window_s: 5.0,
+        max_log_dir_mb: 200,
+        max_log_files: 50,
+        http_bind: null,
+        csv_enabled: true,
+        csv_file: null,
+      };
+
+      function useWebsocket(onMessage) {
+        useEffect(() => {
+          const proto = window.location.protocol === "https:" ? "wss" : "ws";
+          const ws = new WebSocket(`${proto}://${window.location.host}/api/ws/live`);
+          ws.onmessage = (event) => {
+            try {
+              const payload = JSON.parse(event.data);
+              onMessage(payload);
+            } catch (err) {
+              console.error("WS parse error", err);
+            }
+          };
+          return () => ws.close();
+        }, [onMessage]);
+      }
+
+      function App() {
+        const [status, setStatus] = useState({ running: false, stats: {}, available_maps: [], config: defaultConfig });
+        const [logs, setLogs] = useState([]);
+        const [history, setHistory] = useState([]);
+        const [uploading, setUploading] = useState(false);
+        const logRef = useRef(null);
+
+        const mapOptions = useMemo(
+          () => (status.available_maps || []).map((m) => ({ value: m, label: m.split(/[\\/]/).pop() || m })),
+          [status.available_maps]
+        );
+
+        const readOnly = useMemo(() => !status?.config?.allow_write, [status]);
+
+        const fetchStatus = async () => {
+          const res = await fetch("/api/status");
+          const data = await res.json();
+          setStatus((prev) => ({ ...prev, ...data, config: { ...defaultConfig, ...(data.config || {}) } }));
+        };
+
+        useEffect(() => {
+          fetchStatus();
+        }, []);
+
+        useEffect(() => {
+          if (logRef.current) {
+            logRef.current.scrollTop = logRef.current.scrollHeight;
+          }
+        }, [logs]);
+
+        useWebsocket((payload) => {
+          if (payload.type === "log") {
+            setLogs((prev) => {
+              const next = [...prev, payload];
+              return next.slice(-400);
+            });
+            if (payload.message.includes("-->") || payload.message.includes("<--")) {
+              setHistory((prev) => {
+                const next = [...prev, payload.message];
+                return next.slice(-150);
+              });
+            }
+          }
+          if (payload.type === "stats") {
+            setStatus((prev) => ({ ...prev, ...payload.data }));
+          }
+        });
+
+        const updateConfig = async (partial) => {
+          const res = await fetch("/api/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(partial),
+          });
+          const data = await res.json();
+          setStatus((prev) => ({ ...prev, ...data, config: { ...prev.config, ...(data.config || {}) } }));
+        };
+
+        const startProxy = async () => {
+          const res = await fetch("/api/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(status.config || defaultConfig),
+          });
+          const data = await res.json();
+          setStatus((prev) => ({ ...prev, ...data, config: { ...prev.config, ...(data.config || {}) } }));
+        };
+
+        const stopProxy = async () => {
+          const res = await fetch("/api/stop", { method: "POST" });
+          const data = await res.json();
+          setStatus((prev) => ({ ...prev, ...data }));
+        };
+
+        const uploadMap = async (evt) => {
+          evt.preventDefault();
+          const file = evt.target.elements.mapfile.files[0];
+          if (!file) return;
+          setUploading(true);
+          const form = new FormData();
+          form.append("file", file);
+          form.append("set_current", "true");
+          await fetch("/api/map/upload?set_current=true", { method: "POST", body: form });
+          setUploading(false);
+          fetchStatus();
+          evt.target.reset();
+        };
+
+        const cfg = status.config || defaultConfig;
+        const stats = status.stats || {};
+
+        return (
+          <div className="grid" style={{ gap: 20 }}>
+            <div className="card">
+              <h2>Connection</h2>
+              <label>Listen (bind)</label>
+              <input
+                value={cfg.bind || ""}
+                onChange={(e) => setStatus((prev) => ({ ...prev, config: { ...cfg, bind: e.target.value } }))}
+                onBlur={(e) => updateConfig({ bind: e.target.value })}
+              />
+              <label>Upstream target</label>
+              <input
+                value={cfg.target || ""}
+                onChange={(e) => setStatus((prev) => ({ ...prev, config: { ...cfg, target: e.target.value } }))}
+                onBlur={(e) => updateConfig({ target: e.target.value })}
+              />
+              <label>Register map</label>
+              <select
+                value={cfg.map_path || ""}
+                onChange={(e) => updateConfig({ map_path: e.target.value || null })}
+              >
+                <option value="">None</option>
+                {mapOptions.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+              <div className="row">
+                <button onClick={startProxy}>Start / Apply</button>
+                <button className="secondary" onClick={stopProxy} disabled={!status.running}>
+                  Stop
+                </button>
+                <span className={`badge ${status.running ? "green" : "red"}`}>
+                  {status.running ? "Running" : "Stopped"}
+                </span>
+              </div>
+              <form onSubmit={uploadMap}>
+                <label>Upload map (yaml)</label>
+                <input name="mapfile" type="file" accept=".yaml,.yml" />
+                <button type="submit" disabled={uploading}>{uploading ? "Uploading..." : "Upload & select"}</button>
+              </form>
+            </div>
+
+            <div className="card">
+              <h2>Controls</h2>
+              <div className="switch">
+                <input
+                  type="checkbox"
+                  checked={readOnly}
+                  onChange={(e) => updateConfig({ allow_write: !e.target.checked })}
+                />
+                <span>Read-only (block FC06/16)</span>
+              </div>
+              <div className="switch">
+                <input
+                  type="checkbox"
+                  checked={!!cfg.csv_enabled}
+                  onChange={() => updateConfig({ csv_enabled: !cfg.csv_enabled })}
+                />
+                <span>CSV export</span>
+              </div>
+              <div className="switch">
+                <input
+                  type="checkbox"
+                  checked={!!cfg.verbose}
+                  onChange={() => updateConfig({ verbose: !cfg.verbose })}
+                />
+                <span>Verbose logging</span>
+              </div>
+              <label>Log retention (MB)</label>
+              <input
+                type="number"
+                value={cfg.max_log_dir_mb || 0}
+                onChange={(e) => updateConfig({ max_log_dir_mb: Number(e.target.value) })}
+              />
+              <label>Max log files</label>
+              <input
+                type="number"
+                value={cfg.max_log_files || 0}
+                onChange={(e) => updateConfig({ max_log_files: Number(e.target.value) })}
+              />
+            </div>
+
+            <div className="card">
+              <h2>Live Stats</h2>
+              <div className="stats">
+                <div className="stat">Active clients: {stats.active_clients ?? 0}</div>
+                <div className="stat">Requests: {stats.requests ?? 0}</div>
+                <div className="stat">Responses: {stats.responses ?? 0}</div>
+                <div className="stat">Blocked writes: {stats.blocked_writes ?? 0}</div>
+                <div className="stat">Upstream errors: {stats.upstream_errors ?? 0}</div>
+                <div className="stat">Max latency (ms): {stats.max_latency_ms?.toFixed?.(1) ?? 0}</div>
+              </div>
+            </div>
+
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <h2>Request / Response History</h2>
+              <div className="history logs">
+                {history.map((line, idx) => (
+                  <div key={idx}>{line}</div>
+                ))}
+              </div>
+            </div>
+
+            <div className="card" style={{ gridColumn: "1 / -1" }}>
+              <h2>Live Logs</h2>
+              <div className="logs" ref={logRef}>
+                {logs.map((entry, idx) => (
+                  <div key={idx}>
+                    <span style={{ color: "#94a3b8" }}>{new Date(entry.timestamp * 1000).toLocaleTimeString()}</span>
+                    {" "}
+                    <strong style={{ color: entry.level === "warning" ? "#fbbf24" : "#38bdf8" }}>
+                      [{entry.level}]
+                    </strong>{" "}
+                    {entry.message}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>
