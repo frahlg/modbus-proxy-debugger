@@ -1,6 +1,7 @@
 import atexit
 import asyncio
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -10,6 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 try:
     import yaml
@@ -518,6 +520,14 @@ class Stats:
 stats = Stats()
 
 
+@dataclass
+class HttpContext:
+    upstream: "SharedUpstream"
+    map_path: Optional[str]
+    upload_path: str
+    max_frame_bytes: int
+
+
 def build_exception_packet(req: bytes, exception_code: int) -> Optional[bytes]:
     """Constructs a Modbus Exception response for a given request frame."""
     try:
@@ -662,6 +672,17 @@ class SharedUpstream:
         except Exception:
             return False
 
+    async def close(self) -> None:
+        async with self.lock:
+            if self.writer:
+                try:
+                    self.writer.close()
+                    await self.writer.wait_closed()
+                except Exception:
+                    pass
+            self.reader = None
+            self.writer = None
+
 
 def _http_response(status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> bytes:
     reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed", 500: "Error"}.get(
@@ -679,33 +700,301 @@ def _http_response(status: int, body: str, content_type: str = "text/plain; char
     return ("\r\n".join(headers)).encode("utf-8") + body_bytes
 
 
-async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+def _json_response(status: int, payload: dict[str, Any]) -> bytes:
+    return _http_response(status, json.dumps(payload), content_type="application/json")
+
+
+def _build_read_request(unit: int, func_code: int, start: int, qty: int, *, tid: Optional[int] = None) -> bytes:
+    tx_id = tid if tid is not None else int(time.time() * 1000) & 0xFFFF
+    pdu = bytes([func_code]) + struct.pack(">HH", start, qty)
+    mbap = struct.pack(">HHH", tx_id, 0, len(pdu) + 1)
+    return mbap + bytes([unit]) + pdu
+
+
+async def _poll_block(
+    *,
+    context: HttpContext,
+    func_code: int,
+    start: int,
+    quantity: int,
+    unit: int,
+) -> dict[str, Any]:
+    req = _build_read_request(unit, func_code, start, quantity)
+    res = await context.upstream.exchange(req)
+
+    if len(res) < 9:
+        raise ValueError("malformed response from upstream")
+
+    res_tid = struct.unpack(">H", res[0:2])[0]
+    res_func = res[7]
+    if res_func & 0x80:
+        code = res[8]
+        raise ValueError(f"upstream exception code {code}")
+
+    byte_count = res[8]
+    data = res[9 : 9 + byte_count]
+    parsed = mapper.parse_block(start, data, func_code=func_code)
+
+    return {
+        "transaction_id": res_tid,
+        "function": res_func,
+        "start": start,
+        "quantity": quantity,
+        "unit": unit,
+        "byte_count": byte_count,
+        "raw_hex": hex_dump(res),
+        "parsed": [
+            {
+                "address": p["csv"]["addr"],
+                "name": p["csv"]["name"],
+                "hex": p["csv"]["hex"],
+                "dec": p["csv"]["dec"],
+                "scaled": p["csv"]["scaled"],
+                "unit": p["csv"]["unit"],
+                "text": p["text"],
+            }
+            for p in parsed
+        ],
+    }
+
+
+def _mapper_snapshot() -> dict[str, Any]:
+    def _format_func(func_code: Optional[int]) -> list[dict[str, Any]]:
+        regs: list[dict[str, Any]] = []
+        for addr in sorted(mapper.maps_by_func.get(func_code, {})):
+            details = mapper.maps_by_func.get(func_code, {}).get(addr) or {}
+            regs.append(
+                {
+                    "address": addr,
+                    "name": details.get("name", ""),
+                    "type": details.get("type", "U16"),
+                    "scale": details.get("scale", 1),
+                    "unit": details.get("unit", ""),
+                    "function": func_code,
+                }
+            )
+        return regs
+
+    return {
+        "device_name": mapper.device_name,
+        "byte_order": mapper.byte_order,
+        "word_order": mapper.word_order,
+        "maps": {
+            "legacy": _format_func(None),
+            "fc03": _format_func(3),
+            "fc04": _format_func(4),
+        },
+    }
+
+
+INDEX_HTML = """
+<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <title>Modbus Explorer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #0b1221; color: #e2e8f0; }
+    h1 { color: #7bdcb5; }
+    h2 { margin-top: 28px; color: #9cdcfe; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #2d3748; padding: 8px; }
+    th { background: #1f2937; }
+    tr:nth-child(even) { background: #111827; }
+    button { background: #2563eb; color: white; border: none; padding: 6px 10px; cursor: pointer; border-radius: 4px; }
+    button:hover { background: #1d4ed8; }
+    .meta { display: flex; gap: 12px; flex-wrap: wrap; }
+    .meta div { background: #111827; padding: 8px 12px; border-radius: 6px; border: 1px solid #1f2937; }
+    #poll-output { white-space: pre-wrap; background: #0f172a; padding: 12px; border-radius: 6px; border: 1px solid #1f2937; margin-top: 12px; }
+    #upload-area { margin-top: 20px; display: grid; gap: 8px; max-width: 640px; }
+    textarea { width: 100%; min-height: 160px; background: #0f172a; color: #e2e8f0; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; }
+    input[type=\"file\"] { color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <h1>Modbus Explorer</h1>
+  <div class=\"meta\" id=\"meta\"></div>
+  <div id=\"map-container\"></div>
+  <div id=\"poll-output\">Select a register to poll.</div>
+  <div id=\"upload-area\">
+    <h2>Upload/Replace Map</h2>
+    <input type=\"file\" id=\"map-file\" accept=\".yaml,.yml,text/yaml\" />
+    <textarea id=\"map-text\" placeholder=\"Or paste YAML here...\"></textarea>
+    <button id=\"upload-btn\">Upload map</button>
+    <div id=\"upload-status\"></div>
+  </div>
+  <script>
+    const pollOutput = document.getElementById('poll-output');
+    const mapContainer = document.getElementById('map-container');
+    const meta = document.getElementById('meta');
+
+    function quantityForType(type) {
+      return ['U32', 'S32', 'F32'].includes(type) ? 2 : 1;
+    }
+
+    function renderMeta(info) {
+      meta.innerHTML = '';
+      const fields = [
+        ['Device', info.device_name || '—'],
+        ['Byte order', info.byte_order],
+        ['Word order', info.word_order],
+        ['Legacy entries', info.maps.legacy.length],
+        ['FC03 entries', info.maps.fc03.length],
+        ['FC04 entries', info.maps.fc04.length],
+      ];
+      fields.forEach(([label, value]) => {
+        const div = document.createElement('div');
+        div.textContent = `${label}: ${value}`;
+        meta.appendChild(div);
+      });
+    }
+
+    function makeTable(title, rows) {
+      const container = document.createElement('div');
+      const h2 = document.createElement('h2');
+      h2.textContent = title;
+      container.appendChild(h2);
+      const table = document.createElement('table');
+      table.innerHTML = '<tr><th>Address</th><th>Name</th><th>Type</th><th>Scale</th><th>Unit</th><th>Action</th></tr>';
+      rows.forEach(row => {
+        const tr = document.createElement('tr');
+        const cells = [row.address, row.name || '—', row.type || 'U16', row.scale ?? 1, row.unit || ''];
+        cells.forEach(val => {
+          const td = document.createElement('td');
+          td.textContent = val;
+          tr.appendChild(td);
+        });
+        const action = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.textContent = 'Poll now';
+        btn.onclick = () => {
+          const funcCode = row.function === null ? 4 : row.function;
+          pollRegister(row.address, funcCode, row.type || 'U16');
+        };
+        action.appendChild(btn);
+        tr.appendChild(action);
+        table.appendChild(tr);
+      });
+      container.appendChild(table);
+      return container;
+    }
+
+    async function pollRegister(address, funcCode, type) {
+      pollOutput.textContent = 'Polling...';
+      try {
+        const res = await fetch('/api/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ function: funcCode, start: address, quantity: quantityForType(type) }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'poll failed');
+        }
+        const lines = [
+          `Transaction: ${data.transaction_id} | Func: ${data.function} | Start: ${data.start} | Qty: ${data.quantity} | Unit: ${data.unit}`,
+          `Raw: ${data.raw_hex}`,
+        ];
+        if (Array.isArray(data.parsed)) {
+          data.parsed.forEach(p => lines.push(p.text));
+        }
+        pollOutput.textContent = lines.join('\n');
+      } catch (err) {
+        pollOutput.textContent = 'Error: ' + err.message;
+      }
+    }
+
+    async function loadMap() {
+      const res = await fetch('/api/map');
+      const data = await res.json();
+      renderMeta(data);
+      mapContainer.innerHTML = '';
+      mapContainer.appendChild(makeTable('Legacy (FC04 fallback)', data.maps.legacy));
+      mapContainer.appendChild(makeTable('FC03 Holding Registers', data.maps.fc03));
+      mapContainer.appendChild(makeTable('FC04 Input Registers', data.maps.fc04));
+    }
+
+    async function uploadMap() {
+      const fileInput = document.getElementById('map-file');
+      const textArea = document.getElementById('map-text');
+      const status = document.getElementById('upload-status');
+      let payload = textArea.value.trim();
+      if (!payload && fileInput.files.length) {
+        payload = await fileInput.files[0].text();
+      }
+      if (!payload) {
+        status.textContent = 'Please select a file or paste YAML first.';
+        return;
+      }
+      status.textContent = 'Uploading...';
+      const res = await fetch('/api/map/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ yaml: payload }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        status.textContent = 'Upload failed: ' + (data.error || 'unknown error');
+        return;
+      }
+      status.textContent = data.message || 'Map updated';
+      textArea.value = '';
+      fileInput.value = '';
+      await loadMap();
+    }
+
+    document.getElementById('upload-btn').onclick = uploadMap;
+    loadMap();
+  </script>
+</body>
+</html>
+"""
+
+
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, context: HttpContext) -> None:
     try:
         data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
         if not data:
             writer.close()
             return
-        line = data.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-        parts = line.split()
+
+        if b"\r\n\r\n" in data:
+            head, body = data.split(b"\r\n\r\n", 1)
+        else:
+            head, body = data, b""
+
+        header_lines = head.decode("utf-8", errors="replace").split("\r\n")
+        request_line = header_lines[0] if header_lines else ""
+        parts = request_line.split()
         if len(parts) < 2:
             writer.write(_http_response(400, "bad request\n"))
             await writer.drain()
             writer.close()
             return
-        method, path = parts[0], parts[1]
-        if method != "GET":
-            writer.write(_http_response(405, "method not allowed\n"))
-            await writer.drain()
-            writer.close()
-            return
+        method, raw_path = parts[0], parts[1]
+        headers: dict[str, str] = {}
+        for line in header_lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        content_length = int(headers.get("content-length", "0") or 0)
+        while len(body) < content_length:
+            chunk = await asyncio.wait_for(reader.read(content_length - len(body)), timeout=2.0)
+            if not chunk:
+                break
+            body += chunk
+
+        parsed_url = urlparse(raw_path)
+        path = parsed_url.path
 
         uptime_s = max(0.0, time.time() - stats.start_ts)
         avg_latency = (stats.total_latency_ms / stats.responses) if stats.responses else 0.0
 
-        if path in ("/health", "/healthz"):
+        if method == "GET" and path in ("/health", "/healthz"):
             writer.write(_http_response(200, "ok\n"))
-        elif path in ("/metrics", "/stats"):
-            body = (
+        elif method == "GET" and path in ("/metrics", "/stats"):
+            body_text = (
                 f"uptime_seconds {uptime_s:.0f}\n"
                 f"active_clients {stats.active_clients}\n"
                 f"total_clients {stats.total_clients}\n"
@@ -716,7 +1005,53 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 f"avg_latency_ms {avg_latency:.2f}\n"
                 f"max_latency_ms {stats.max_latency_ms:.2f}\n"
             )
-            writer.write(_http_response(200, body))
+            writer.write(_http_response(200, body_text))
+        elif method == "GET" and path == "/api/map":
+            writer.write(_json_response(200, _mapper_snapshot()))
+        elif method == "POST" and path == "/api/poll":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                func_code = int(payload.get("function"))
+                start = int(payload.get("start"))
+                qty = int(payload.get("quantity") or 1)
+                unit = int(payload.get("unit") or 1)
+                if func_code not in (3, 4):
+                    raise ValueError("function must be 3 or 4")
+                if qty <= 0:
+                    raise ValueError("quantity must be positive")
+                result = await _poll_block(context=context, func_code=func_code, start=start, quantity=qty, unit=unit)
+                writer.write(_json_response(200, result))
+            except Exception as e:
+                writer.write(_json_response(400, {"error": str(e)}))
+        elif method == "POST" and path == "/api/map/upload":
+            try:
+                if headers.get("content-type", "").startswith("application/json"):
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                    yaml_text = payload.get("yaml") or ""
+                else:
+                    yaml_text = body.decode("utf-8") if body else ""
+                if not yaml_text.strip():
+                    raise ValueError("no YAML provided")
+                tmp_path = f"{context.upload_path}.tmp"
+                os.makedirs(os.path.dirname(context.upload_path) or ".", exist_ok=True)
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(yaml_text)
+
+                # Validate with duplicate-key protection before swapping in globally.
+                try:
+                    _ = ModbusMapper(tmp_path)
+                except Exception:
+                    os.remove(tmp_path)
+                    raise
+
+                os.replace(tmp_path, context.upload_path)
+                mapper.load(context.upload_path)
+                context.map_path = context.upload_path
+                writer.write(_json_response(200, {"message": "Map uploaded and reloaded."}))
+            except Exception as e:
+                writer.write(_json_response(400, {"error": str(e)}))
+        elif method == "GET" and path == "/":
+            writer.write(_http_response(200, INDEX_HTML, content_type="text/html; charset=utf-8"))
         else:
             writer.write(_http_response(404, "not found\n"))
 
@@ -923,6 +1258,14 @@ async def start_proxy(
     b_host, b_port_str = bind.split(":")
     log_dir = os.path.dirname(log_file) if log_file else None
 
+    upload_path = map_path or os.path.join("maps", "uploaded_map.yaml")
+    http_context = HttpContext(
+        upstream=upstream,
+        map_path=map_path,
+        upload_path=upload_path,
+        max_frame_bytes=max_frame_bytes,
+    )
+
     server = await asyncio.start_server(
         lambda r, w: handle_client(
             r,
@@ -940,10 +1283,18 @@ async def start_proxy(
         int(b_port_str),
     )
 
+    async def _close_upstream_when_server_stops() -> None:
+        await server.wait_closed()
+        await upstream.close()
+
+    asyncio.create_task(_close_upstream_when_server_stops())
+
     http_server = None
     if http_bind:
         h_host, h_port_str = http_bind.split(":")
-        http_server = await asyncio.start_server(handle_http, h_host, int(h_port_str))
+        http_server = await asyncio.start_server(
+            lambda r, w: handle_http(r, w, context=http_context), h_host, int(h_port_str)
+        )
 
     logger.info(f"Proxying {bind} -> {target}")
     if map_path:
@@ -951,7 +1302,9 @@ async def start_proxy(
     if not allow_write:
         logger.warning("Write blocking enabled (read-only proxy). Use --allow-write to permit FC06/FC16.")
     if http_bind:
-        logger.info(f"HTTP monitoring on {http_bind} (GET /health, /metrics)")
+        logger.info(
+            f"HTTP monitoring on {http_bind} (GET /health, /metrics, / for explorer, /api/map, /api/poll, /api/map/upload)"
+        )
 
     return server, http_server
 

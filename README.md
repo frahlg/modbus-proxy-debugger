@@ -62,6 +62,26 @@ uv run main.py --target 192.168.1.50:502 --http 127.0.0.1:8080
 ```
 Then query `GET /health` or `GET /metrics`.
 
+### Web explorer & API
+When `--http` is enabled, visit the root path (e.g. `http://127.0.0.1:8080/`) to open the explorer.
+
+You can:
+- Browse all loaded registers grouped by FC03/FC04/legacy
+- Click **Poll now** to fetch live values using `ModbusMapper.parse_block`
+- Upload/replace YAML maps directly in the UI. Uploads are validated with the duplicate-key protection used by the proxy, so malformed files are rejected safely.
+
+API endpoints available on the same HTTP listener:
+- `GET /api/map` – returns the current map structure and metadata
+- `POST /api/poll` – body: `{ "function": 3|4, "start": <addr>, "quantity": <registers>, "unit": <id optional> }`
+- `POST /api/map/upload` – body: `{ "yaml": "..." }` to replace the active map
+
+### Workflow: adding a new device map
+1) Start from one of the examples in `maps/` and author your YAML (includes are supported).
+2) Open the explorer UI and upload your YAML via the **Upload/Replace Map** section. Duplicate keys are blocked automatically.
+3) Confirm the device metadata (byte order, word order, register counts) in the header cards.
+4) Use **Poll now** on a few key registers to validate scaling and units against expected values.
+5) Iterate on the YAML and re-upload until the decoded values match the device documentation.
+
 ## Register Maps
 
 Maps are located in the `maps/` directory.
